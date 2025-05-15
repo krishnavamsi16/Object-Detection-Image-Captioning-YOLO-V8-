@@ -1,0 +1,119 @@
+###yolov8 model
+import torch
+import pandas as pd  
+from PIL import Image
+import matplotlib.pyplot as plt
+from transformers import BlipProcessor, BlipForConditionalGeneration, AutoTokenizer, AutoModelForSeq2SeqLM
+from ultralytics import YOLO
+
+class ImageAnalyzer:
+    def __init__(self):
+        # Load YOLOv8 model
+        self.yolo_model = YOLO('yolov8n.pt') 
+
+        # Load BLIP image captioning model
+        self.blip_processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
+        self.blip_model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base")
+
+        # Load language model for refining descriptions
+        self.lm_tokenizer = AutoTokenizer.from_pretrained("google/flan-t5-base")
+        self.lm_model = AutoModelForSeq2SeqLM.from_pretrained("google/flan-t5-base")
+
+    def visualize_results(self, image_path, objects):
+        # Load and display the image
+        img = Image.open(image_path)
+        fig, ax = plt.subplots(1, figsize=(12, 8))
+        ax.imshow(img)
+
+        # Draw bounding boxes
+        for _, row in objects.iterrows():
+            x1, y1, x2, y2 = row['xmin'], row['ymin'], row['xmax'], row['ymax']
+            rect = plt.Rectangle((x1, y1), x2 - x1, y2 - y1, fill=False, edgecolor='red', linewidth=2)
+            ax.add_patch(rect)
+            ax.text(x1, y1, f"{row['name']} ({row['confidence']:.2f})", color='white', fontweight='bold',
+                    bbox=dict(facecolor='red', edgecolor='none', alpha=0.7))
+
+        ax.axis('off')  # Turn off the axes
+        plt.title("Detected Objects")
+        plt.savefig("analyzed_image.png")  # Save visualization
+        plt.show()
+
+    def detect_objects(self, image_path):
+        img = Image.open(image_path).convert('RGB')
+        results = self.yolo_model(img, conf=0.25, iou=0.45)  # Experiment with confidence and IOU thresholds
+
+        # Check if results contain 'boxes'
+        if not results or not results[0].boxes:
+            print("Error: YOLO model did not return expected results or no objects detected.")
+            return None
+
+        result = results[0]
+        if result.boxes.xyxy.numel() == 0:
+            print("Error: No objects detected in the image.")
+            return None
+
+        # Extract detection results manually and reshape the boxes array
+        boxes = result.boxes.xyxy.cpu().numpy()  # Convert to numpy array and extract coordinates
+        class_ids = result.boxes.cls.cpu().numpy()  # Class IDs
+        confidences = result.boxes.conf.cpu().numpy()  # Confidence scores
+
+        # Convert results to a pandas DataFrame
+        detections = pd.DataFrame(boxes, columns=['xmin', 'ymin', 'xmax', 'ymax'])  # Now boxes and column names have the same length
+        detections['class_id'] = class_ids
+        detections['confidence'] = confidences
+
+        # Map class IDs to class names
+        detections['name'] = detections['class_id'].apply(lambda x: self.yolo_model.names[int(x)])
+
+        print("Detections DataFrame:", detections)  # Debugging print
+
+        return detections
+
+    def generate_caption(self, image_path):
+        img = Image.open(image_path).convert('RGB')
+        inputs = self.blip_processor(img, return_tensors="pt")
+        output = self.blip_model.generate(**inputs, max_new_tokens=20)
+        return self.blip_processor.decode(output[0], skip_special_tokens=True)
+
+    def refine_description(self, objects, caption):
+        prompt = f"""
+        Refine and expand the following image description:
+        Caption: {caption}
+        Detected objects: {', '.join(objects['name'].tolist())}
+
+        Provide a detailed description including colors, sizes, and relationships between objects.
+        """
+        inputs = self.lm_tokenizer(prompt, return_tensors="pt")
+        output = self.lm_model.generate(**inputs, max_length=200, num_return_sequences=1, do_sample=True)
+        return self.lm_tokenizer.decode(output[0], skip_special_tokens=True)
+
+    def analyze_image(self, image_path):
+        # Detect objects
+        objects = self.detect_objects(image_path)
+
+        # Handle the case when no objects are detected
+        if objects is None:
+            print("No objects detected. Cannot generate caption or description.")
+            return None
+
+        print("Detected objects:", objects['name'].tolist())
+
+        # Generate caption
+        caption = self.generate_caption(image_path)
+        print("Generated caption:", caption)
+
+        # Refine description
+        detailed_description = self.refine_description(objects, caption)
+        print("Detailed description:", detailed_description)
+
+        # Visualize results
+        self.visualize_results(image_path, objects)
+
+        return detailed_description
+
+
+if __name__ == "__main__":
+    analyzer = ImageAnalyzer()
+    image_path = "/content/R (1).jpg"  # Replace with the actual path to your image
+    result = analyzer.analyze_image(image_path)
+    print("Analysis complete. Check 'analyzed_image.png' for visualization.")
